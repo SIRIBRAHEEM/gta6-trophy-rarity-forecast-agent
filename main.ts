@@ -1,33 +1,26 @@
-// gta6-trophy-rarity-forecast-01 entry (Node 22, standard library only).
+// GTA VI trophy-rarity forecast (make.fun gta6-trophy-rarity-forecast-01).
 //
-// Forecast, for every trophy of Grand Theft Auto VI on PlayStation 5, its earn
-// rate on Exophase at the case's target, as five quantiles (5/25/50/75/95%) of
-// the rate in percent. Score is the mean pinball loss on the logit scale.
+// Forecasts, for every PS5 trophy of Grand Theft Auto VI, its Exophase earn
+// rate at the case's target, as five quantiles (5/25/50/75/95%) of the rate
+// in percent. Scored by mean pinball loss on the logit scale.
 //
-// How it works, in one paragraph. An earn rate is a ratio: the players who
-// earned a trophy over the players Exophase tracks. The two move differently —
-// the tracked pool grows in jumps whenever Exophase refreshes its counts
-// (diluting every rate), while the earned counts only ever grow as players
-// play. So this forecaster splits the rate into its two parts and models each
-// separately: the earned count of every trophy and the tracked-player count,
-// each fitted as a straight line of its log against log(1 + hours since
-// release), the earned-count slopes shrunk toward their tier's mean slope so
-// rare trophies with little data borrow strength from their tier. The median
-// rate is the two forecasts divided. The spread around it is honest about
-// three things: a random walk that widens with the horizon, the uncertainty of
-// the fitted slopes over the extrapolation, and how much the counts jitter
-// around their trends (the refresh noise in the case's own history). On top of
-// that, when the horizon is shorter than one refresh cycle and the page has
-// gone stale — no refresh for much longer than the usual gap between
-// refreshes — a refresh is overdue, and the forecast becomes a mixture: with
-// some probability no refresh comes before the target and the trend holds,
-// with the rest a refresh lands and dilutes every rate by the drop a refresh
-// usually brings. The five quantiles are the quantiles of that mixture, so
-// the band widens and skews down instead of pretending the rate will sit
-// still. With fresh data, or over a long horizon where the trend already
-// absorbs the refreshes, the mixture switches off and the trend does the work.
+// The model, per trophy, in logit space:
+//   - a Theil-Sen robust line of logit(rate) against ln(1 + hours since
+//     2026-11-19T00:00Z), fitted on the case's history; the median at the
+//     target is the line read at the target. Theil-Sen resists the discrete
+//     drops Exophase's refreshes cause, which corrupt a least-squares fit.
+//   - the spread combines the baseline's random-walk term (0.5*sqrt(days)),
+//     the fit's residual scale, slope uncertainty times the extrapolation
+//     distance, and -- where the history shows refresh jumps -- the variance
+//     of the jumps still to come before the target.
+//   - when the history is flat (no refresh yet, every rate unchanged, short
+//     horizon -- the launch-night practice shape), the answer is a mixture:
+//     no refresh before the target (rates stay) or a refresh (newly tracked
+//     players dilute every rate to about a fifth). The quantiles invert that
+//     mixture, so the band covers both outcomes instead of betting on one.
 //
-// Usage: mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
+// Node 22, standard library only, no network, deterministic: two runs of
+// the same case write byte-identical output.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -39,42 +32,17 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 /** The standard normal's quantile at each level. */
 const Z = [-1.645, -0.674, 0, 0.674, 1.645];
-/** Random-walk spread, in logit units per square-root day (the baseline's). */
-const SIGMA_RW = 0.5;
-/** Prior per-refresh logit jump when the history holds no refresh. */
-const JUMP_PRIOR = 0.8;
-/** Prior gap between refreshes, in hours, when the history holds none. */
-const INTERVAL_PRIOR_H = 4;
-/** Prior logit drop one refresh brings, when the history holds no refresh. */
-const DILUTION_PRIOR = 1.5;
-/** Prior strength (in distinct values) when shrinking a slope to its tier mean. */
-const SHRINK_K = 2;
-/** The tracked-player count never grows by more than this factor over the horizon. */
-const N_GROWTH_CAP = 4;
-/** An earned count never exceeds this share of the tracked players. */
-const E_CAP_FRAC = 0.995;
-/** The spread never goes below this, in logit units. */
-const SPREAD_MIN = 0.2;
-/** The spread never goes above this, in logit units. */
-const SPREAD_MAX = 2.5;
+/** Release-day origin for the log-time axis (the house curve baseline's). */
+const ORIGIN_MS = Date.parse('2026-11-19T00:00:00Z');
 
-interface Trophy {
-  id: number;
-  tier: string;
-}
-
-interface Read {
-  at: string;
-  players_tracked: number;
-  rates: Array<number | null>;
-}
-
+interface Trophy { id: number; name: string; tier: string }
+interface Read { slot: string; at: string; players_tracked: number; rates: Array<number | null> }
 interface Case {
   id: string;
   at: string;
   horizon_minutes: number;
+  target: string;
   levels: number[];
-  game: { release_date: string };
   trophies: Trophy[];
   history: Read[];
 }
@@ -84,183 +52,190 @@ const logit = (pct: number): number => Math.log(clamp(pct) / (100 - clamp(pct)))
 const invLogit = (l: number): number => 100 / (1 + Math.exp(-l));
 /** x rounded to 4 decimals. */
 const round4 = (x: number): number => Math.round(x * 10000) / 10000;
-/** Median of a list of numbers. */
-const median = (xs: number[]): number => {
-  if (xs.length === 0) return 0;
-  const s = [...xs].sort((a, b) => a - b);
-  const m = Math.floor(s.length / 2);
-  return s.length % 2 === 1 ? s[m] : (s[m - 1] + s[m]) / 2;
+
+const median = (v: number[]): number => {
+  if (v.length === 0) return 0;
+  const s = [...v].sort((a, b) => a - b);
+  const n = s.length;
+  return n % 2 === 1 ? s[(n - 1) / 2] : 0.5 * (s[n / 2 - 1] + s[n / 2]);
 };
-/** Mean of a list of numbers. */
-const mean = (xs: number[]): number => (xs.length === 0 ? 0 : xs.reduce((a, b) => a + b, 0) / xs.length);
-/** The standard normal's cumulative distribution, by a rational approximation. */
+
+/** Standard normal CDF (Abramowitz-Stegun 7.1.26, |error| < 1.5e-7). */
 const normCdf = (x: number): number => {
   const t = 1 / (1 + 0.2316419 * Math.abs(x));
-  const d = 0.3989423 * Math.exp((-x * x) / 2);
+  const d = 0.3989423 * Math.exp(-x * x / 2);
   const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
   return x > 0 ? 1 - p : p;
 };
 
-/** Least-squares line of y on x. Returns slope, intercept and residual spread. */
-const fitLine = (xs: number[], ys: number[]): { slope: number; intercept: number; resid: number; slopeSe: number } => {
+/**
+ * Theil-Sen slope of ys on xs (median of pairwise slopes). Subsamples to
+ * at most 80 points so the pair count stays small on long histories.
+ */
+const theilSen = (xs: number[], ys: number[]): number => {
   const n = xs.length;
-  if (n < 2) return { slope: 0, intercept: n === 1 ? ys[0] : 0, resid: 0, slopeSe: 0 };
-  const mx = mean(xs);
-  const my = mean(ys);
-  let sxx = 0;
-  let sxy = 0;
-  for (let i = 0; i < n; i++) {
-    sxx += (xs[i] - mx) * (xs[i] - mx);
-    sxy += (xs[i] - mx) * (ys[i] - my);
+  if (n < 2) return 0;
+  let px = xs;
+  let py = ys;
+  if (n > 80) {
+    const idx: number[] = [];
+    for (let i = 0; i < 80; i++) idx.push(Math.round((i * (n - 1)) / 79));
+    px = idx.map((i) => xs[i]);
+    py = idx.map((i) => ys[i]);
   }
-  const slope = sxx > 0 ? sxy / sxx : 0;
-  const intercept = my - slope * mx;
-  let sse = 0;
-  for (let i = 0; i < n; i++) sse += (ys[i] - (intercept + slope * xs[i])) ** 2;
-  const resid = Math.sqrt(sse / Math.max(1, n - 2));
-  return { slope, intercept, resid, slopeSe: sxx > 0 ? resid / Math.sqrt(sxx) : 0 };
+  const slopes: number[] = [];
+  for (let i = 0; i < px.length; i++) {
+    for (let j = i + 1; j < px.length; j++) {
+      const dx = px[j] - px[i];
+      if (Math.abs(dx) > 1e-9) slopes.push((py[j] - py[i]) / dx);
+    }
+  }
+  return slopes.length === 0 ? 0 : median(slopes);
 };
 
-/** One distinct page: the reads collapse to the moments the page actually changed. */
-interface Snap {
-  /** When this page was first seen (for staleness: the page has held since then). */
-  firstMs: number;
-  /** When this page was last seen (for fitting: the value held until then). */
-  atMs: number;
-  x: number;
-  players: number;
-  rates: number[];
-}
+/**
+ * One quantile of a two-component normal mixture on the logit scale:
+ * with probability (1 - p) the answer sits near m0, with probability p
+ * near m1 (a refresh), each with spread s0. Inverts the mixture CDF by
+ * bisection.
+ */
+const mixtureQuantile = (m0: number, m1: number, p: number, s0: number, tau: number): number => {
+  let lo = Math.min(m0, m1) - 8 * s0 - 2;
+  let hi = Math.max(m0, m1) + 8 * s0 + 2;
+  for (let k = 0; k < 90; k++) {
+    const mid = 0.5 * (lo + hi);
+    const cdf = (1 - p) * normCdf((mid - m0) / s0) + p * normCdf((mid - m1) / s0);
+    if (cdf < tau) lo = mid;
+    else hi = mid;
+  }
+  return invLogit(0.5 * (lo + hi));
+};
 
-const forecastCase = (c: Case): Array<{ id: number; q: number[] }> => {
-  const releaseMs = Date.parse(c.game.release_date);
-  const originMs = Number.isFinite(releaseMs) ? releaseMs : Date.parse('2026-11-19T00:00:00Z');
-  const atMs = Date.parse(c.at);
-  const horizonDays = c.horizon_minutes / 1440;
-  const horizonHours = c.horizon_minutes / 60;
-  const xTarget = Math.log(1 + Math.max(0, (atMs + c.horizon_minutes * 60000 - originMs) / 3600000));
+/** Hours from the release-day origin to an ISO timestamp. */
+const hoursSinceOrigin = (iso: string): number =>
+  (Date.parse(iso) - ORIGIN_MS) / 3_600_000;
+/** Log-time axis: ln(1 + hours since the origin). */
+const logTime = (iso: string): number => Math.log(Math.max(0.05, 1 + hoursSinceOrigin(iso)));
 
-  // Collapse the history to distinct pages, keeping the last time each page was seen.
-  const snaps: Snap[] = [];
-  for (const h of c.history) {
-    const rates = h.rates.map((r) => (r === null ? 0 : r));
-    const prev = snaps[snaps.length - 1];
-    if (prev !== undefined && prev.players === h.players_tracked && prev.rates.every((r, i) => r === rates[i])) {
-      prev.atMs = Date.parse(h.at);
-      prev.x = Math.log(1 + Math.max(0, (prev.atMs - originMs) / 3600000));
+/**
+ * Forecast one case. Returns the { trophies: [{id, q: [q05..q95]}] } object
+ * the scorer reads.
+ */
+const forecastCase = (c: Case): { trophies: Array<{ id: number; q: number[] }> } => {
+  const hist = c.history;
+  const horizonH = c.horizon_minutes / 60;
+  const xTarget = logTime(c.target);
+
+  // Refresh jumps in the history: consecutive reads where the tracked-player
+  // count jumps by more than 3%. Each event records the median logit move
+  // across the trophies (dilution drops rates; the median resists trophies
+  // that moved for other reasons).
+  const jumpSizes: number[] = [];
+  for (let i = 1; i < hist.length; i++) {
+    const n0 = hist[i - 1].players_tracked;
+    const n1 = hist[i].players_tracked;
+    if (!n0 || (n1 - n0) / n0 <= 0.03) continue;
+    const ds: number[] = [];
+    for (let k = 0; k < c.trophies.length; k++) {
+      const r0 = hist[i - 1].rates[k];
+      const r1 = hist[i].rates[k];
+      if (r0 !== null && r1 !== null && r0 < 99.99) ds.push(logit(r1) - logit(r0));
+    }
+    if (ds.length > 0) jumpSizes.push(median(ds));
+  }
+  const spanH =
+    hist.length > 1
+      ? (Date.parse(hist[hist.length - 1].at) - Date.parse(hist[0].at)) / 3_600_000
+      : 0;
+  const jumpRate = spanH > 0 ? jumpSizes.length / spanH : 0;
+  let jumpSd = 0;
+  if (jumpSizes.length >= 2) {
+    const mu = jumpSizes.reduce((a, b) => a + b, 0) / jumpSizes.length;
+    jumpSd = Math.sqrt(
+      jumpSizes.reduce((a, b) => a + (b - mu) * (b - mu), 0) / (jumpSizes.length - 1),
+    );
+  }
+
+  const out: Array<{ id: number; q: number[] }> = [];
+  for (let ti = 0; ti < c.trophies.length; ti++) {
+    const t = c.trophies[ti];
+    // Most recent non-null rate for this trophy.
+    let lastRate: number | null = null;
+    for (let i = hist.length - 1; i >= 0; i--) {
+      if (hist[i].rates[ti] !== null) {
+        lastRate = hist[i].rates[ti] as number;
+        break;
+      }
+    }
+    // A trophy nobody has earned yet sits at (or near) 100%: forecast it
+    // tight at the top; a refresh cannot push it down.
+    if (lastRate !== null && lastRate >= 99.99) {
+      out.push({ id: t.id, q: [99.99, 99.99, 99.99, 99.99, 99.99] });
       continue;
     }
-    const at = Date.parse(h.at);
-    snaps.push({ firstMs: at, atMs: at, x: Math.log(1 + Math.max(0, (at - originMs) / 3600000)), players: h.players_tracked, rates });
-  }
-  if (snaps.length === 0) throw new Error(`${c.id} has no history`);
-  const last = snaps[snaps.length - 1];
-  const lastX = last.x;
-  const lastN = Math.max(1, last.players);
 
-  // Refreshes: the moments the page changed, how far apart, and what each did to the rates.
-  const changeTimes: number[] = [];
-  const refreshDrops: number[] = [];
-  for (let s = 1; s < snaps.length; s++) {
-    const prev = snaps[s - 1];
-    const cur = snaps[s];
-    changeTimes.push(cur.firstMs);
-    const drops: number[] = [];
-    for (let i = 0; i < c.trophies.length; i++) {
-      if (prev.rates[i] <= 0 || cur.rates[i] <= 0 || prev.rates[i] >= 100 || cur.rates[i] >= 100) continue;
-      drops.push(-(logit(cur.rates[i]) - logit(prev.rates[i])));
+    const series: Array<[number, number]> = [];
+    for (const h of hist) {
+      const r = h.rates[ti];
+      if (r === null) continue;
+      series.push([logTime(h.at), logit(r)]);
     }
-    if (drops.length > 0) refreshDrops.push(median(drops));
-  }
-  const gaps: number[] = [];
-  for (let s = 1; s < changeTimes.length; s++) gaps.push((changeTimes[s] - changeTimes[s - 1]) / 3600000);
-  const intervalH = gaps.length > 0 ? median(gaps) : INTERVAL_PRIOR_H;
-  const dropTypical = refreshDrops.length > 0 ? Math.max(0, median(refreshDrops)) : DILUTION_PRIOR;
-
-  // The tracked-player count: log-linear in log-time, anchored at the last read.
-  const xs = snaps.map((s) => s.x);
-  const nFit = fitLine(xs, snaps.map((s) => Math.log(Math.max(1, s.players))));
-  const nDistinct = new Set(snaps.map((s) => s.players)).size;
-  const nSlope = nFit.slope * (nDistinct / (nDistinct + 1));
-  const logNTarget = Math.log(lastN) + nSlope * (xTarget - lastX);
-  const nTarget = Math.min(lastN * N_GROWTH_CAP, Math.max(lastN, Math.exp(logNTarget)));
-
-  // Each trophy's earned count: log-linear in log-time, slope shrunk to its tier mean.
-  const slopes: number[] = [];
-  const slopeSes: number[] = [];
-  const eResids: number[] = [];
-  const nDistinctPerTrophy: number[] = [];
-  for (let i = 0; i < c.trophies.length; i++) {
-    const ys: number[] = [];
-    const xsi: number[] = [];
-    for (const s of snaps) {
-      const e = Math.max(0.5, (s.rates[i] / 100) * s.players);
-      ys.push(Math.log(e));
-      xsi.push(s.x);
+    if (series.length === 0) {
+      // No valid read for this trophy at all: neutral prior, wide spread.
+      const q = Z.map((z) => round4(invLogit(logit(1) + z * 1.5)));
+      out.push({ id: t.id, q: q.sort((a, b) => a - b).map((v) => Math.max(0, Math.min(100, v))) });
+      continue;
     }
-    nDistinctPerTrophy.push(new Set(ys.map((y) => Math.round(y * 1000))).size);
-    const fit = fitLine(xsi, ys);
-    slopes.push(fit.slope);
-    slopeSes.push(fit.slopeSe);
-    eResids.push(fit.resid);
-  }
-  const tierMean: Record<string, number | null> = {};
-  for (const tier of [...new Set(c.trophies.map((t) => t.tier))]) {
-    const vals: number[] = [];
-    c.trophies.forEach((t, i) => {
-      if (t.tier === tier && nDistinctPerTrophy[i] >= 2) vals.push(slopes[i]);
-    });
-    tierMean[tier] = vals.length > 0 ? mean(vals) : null;
-  }
-  const globalVals = slopes.filter((_, i) => nDistinctPerTrophy[i] >= 2);
-  const globalMean = globalVals.length > 0 ? mean(globalVals) : 0;
 
-  // How stale is the page, and is a refresh overdue before the target? The page
-  // has held since the last snap was FIRST seen, not since it was last seen.
-  const lastChangeMs = changeTimes.length > 0 ? changeTimes[changeTimes.length - 1] : snaps[0].firstMs;
-  const staleHours = Math.max(0, (atMs - lastChangeMs) / 3600000);
-  const timeToNext = Math.max(0.5, intervalH - staleHours);
-  const pRefresh = horizonHours < intervalH ? 1 - Math.exp(-horizonHours / timeToNext) : 0;
+    const xs = series.map((s) => s[0]);
+    const ys = series.map((s) => s[1]);
+    const b = series.length >= 3 ? theilSen(xs, ys) : 0;
+    const a = median(ys.map((y, i) => y - b * xs[i]));
+    const m = a + b * xTarget;
 
-  // The spread: random walk + slope uncertainty + the counts' jitter around their trends.
-  const sRw = SIGMA_RW * Math.sqrt(horizonDays);
-  const sResid = Math.sqrt(median(eResids) ** 2 + nFit.resid ** 2);
+    // Spread: random-walk term + residual scale + slope uncertainty over
+    // the extrapolation distance, in quadrature.
+    const resid = ys.map((y, i) => y - (a + b * xs[i]));
+    const residMed = median(resid);
+    const sigResid = Math.min(
+      1.4826 * median(resid.map((r) => Math.abs(r - residMed))),
+      1,
+    );
+    const xBar = xs.reduce((s, v) => s + v, 0) / xs.length;
+    const xSd = Math.sqrt(xs.reduce((s, v) => s + (v - xBar) * (v - xBar), 0) / xs.length);
+    const sigSlope = xSd > 0 && xs.length > 2 ? sigResid / (xSd * Math.sqrt(xs.length)) : 0;
+    const sigExtrap = Math.abs(sigSlope * (xTarget - xBar));
+    const sigRw = 0.5 * Math.sqrt(c.horizon_minutes / 1440);
+    let sig0 = Math.sqrt(sigRw * sigRw + sigResid * sigResid + sigExtrap * sigExtrap);
+    sig0 = Math.min(Math.max(sig0, 0.15), 2);
 
-  return c.trophies.map((t, i) => {
-    const tier = tierMean[t.tier] ?? globalMean;
-    const w = nDistinctPerTrophy[i] / (nDistinctPerTrophy[i] + SHRINK_K);
-    const slope = w * slopes[i] + (1 - w) * tier;
-    const lastE = Math.max(0.5, (last.rates[i] / 100) * lastN);
-    let eTarget = Math.exp(Math.log(lastE) + slope * (xTarget - lastX));
-    eTarget = Math.min(E_CAP_FRAC * nTarget, Math.max(0.5, eTarget));
-    const medianRate = clamp((eTarget / nTarget) * 100);
-    const sSlope = Math.min(1.5, slopeSes[i] * (xTarget - lastX));
-    const s0 = Math.min(SPREAD_MAX, Math.max(SPREAD_MIN, Math.sqrt(sRw * sRw + sSlope * sSlope + sResid * sResid)));
-    const l0 = logit(medianRate);
-    let q: number[];
-    if (pRefresh > 0.01) {
-      // Mixture: with probability 1-p the trend holds, with probability p a
-      // refresh lands first and dilutes the rate by dropTypical logit units.
-      const lo = l0 - dropTypical - 5 * s0;
-      const hi = l0 + 5 * s0;
-      const cdf = (x: number): number => (1 - pRefresh) * normCdf((x - l0) / s0) + pRefresh * normCdf((x - (l0 - dropTypical)) / s0);
-      q = LEVELS.map((tau) => {
-        let a = lo;
-        let b = hi;
-        for (let k = 0; k < 80; k++) {
-          const m = (a + b) / 2;
-          if (cdf(m) < tau) a = m;
-          else b = m;
-        }
-        return round4(clamp(invLogit((a + b) / 2)));
-      });
-    } else {
-      q = Z.map((z) => round4(clamp(invLogit(l0 + z * s0))));
+    // Flat history, no refresh seen yet, short horizon: the launch-night
+    // shape. Exophase refreshes hours apart and the tracked count has been
+    // frozen the whole history, so a refresh before the target is a live
+    // possibility -- and a refresh dilutes every rate: newly tracked players
+    // hold far fewer trophies, so the refreshed rate is about a fifth of the
+    // stale one (a batch ~5x the tracked count, new players at ~7% of the
+    // incumbents' earn rates). Forecast the mixture, not one branch.
+    const yRange = Math.max(...ys) - Math.min(...ys);
+    if (jumpSizes.length === 0 && yRange < 0.05 && horizonH <= 12 && lastRate !== null) {
+      const f = (1 + 5 * 0.07) / 6; // ~0.225 dilution factor
+      const m0 = logit(lastRate);
+      const m1 = logit(lastRate * f);
+      const q = LEVELS.map((tau) => round4(mixtureQuantile(m0, m1, 0.5, sig0, tau)));
+      out.push({ id: t.id, q: q.sort((x, y) => x - y).map((v) => Math.max(0, Math.min(100, v))) });
+      continue;
     }
-    // Keep the row non-decreasing after rounding.
-    for (let j = 1; j < q.length; j++) q[j] = Math.max(q[j], q[j - 1]);
-    return { id: t.id, q };
-  });
+
+    // Data branch: the trend is the median; refreshes still to come add
+    // variance around it (their mean is already in the trend).
+    if (jumpSizes.length > 0) {
+      const kExp = jumpRate * horizonH;
+      sig0 = Math.min(Math.sqrt(sig0 * sig0 + kExp * jumpSd * jumpSd), 2.5);
+    }
+    const q = Z.map((z) => round4(invLogit(m + z * sig0)));
+    out.push({ id: t.id, q: q.sort((x, y) => x - y).map((v) => Math.max(0, Math.min(100, v))) });
+  }
+  return { trophies: out };
 };
 
 mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -269,9 +244,9 @@ const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
 for (const file of inputs) {
   const id = file.slice(0, -'.in'.length);
   const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
-  if (c.levels.length !== LEVELS.length || c.levels.some((t, j) => t !== LEVELS[j])) throw new Error(`${file} asks for levels ${JSON.stringify(c.levels)}, not ${JSON.stringify(LEVELS)}`);
+  if (c.levels.length !== LEVELS.length || c.levels.some((t, j) => t !== LEVELS[j])) {
+    throw new Error(`${file} asks for levels ${JSON.stringify(c.levels)}, not ${JSON.stringify(LEVELS)}`);
+  }
   if (c.history.length === 0) throw new Error(`${file} has no history`);
-  const trophies = forecastCase(c);
-  if (trophies.length !== c.trophies.length) throw new Error(`${file} forecast ${trophies.length} trophies, case has ${c.trophies.length}`);
-  writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ trophies })}\n`);
+  writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify(forecastCase(c))}\n`);
 }
